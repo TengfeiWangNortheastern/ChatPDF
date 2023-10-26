@@ -1,10 +1,16 @@
-import { PineconeClient } from '@pinecone-database/pinecone';
+import { PineconeClient,Vector } from '@pinecone-database/pinecone';
 import { downloadFromS3 } from './s3-server';
 import {PDFLoader} from 'langchain/document_loaders/fs/pdf'
+import { Document, RecursiveCharacterTextSplitter } from '@pinecone-database/doc-splitter';
+import { getEmbeddings } from './embeddings';
+import { convertToAscii } from './utils';
+import md5 from 'md5';
+import { type } from 'os';
+import { fromJSON } from 'postcss';
 
 let pinecone:PineconeClient | null = null;
 
-export const getPinecone = async () => {
+export const getPineconeClient = async () => {
     if(!pinecone){
         pinecone = new PineconeClient()
             await pinecone.init({
@@ -13,7 +19,14 @@ export const getPinecone = async () => {
             });
         }
     
-    return pinecone
+    return pinecone;
+}
+
+type PDFPage = {
+    pageContent:string;
+    metadata:{
+        loc: {pageNumber:number};
+    }
 }
 
 export async function loadS3IntoPinecone(fileKey:string) {
@@ -24,7 +37,64 @@ export async function loadS3IntoPinecone(fileKey:string) {
         throw new Error('file not found from s3');
     }
     const loader = new PDFLoader(file_name);
-    const pages = loader.load();
+    const pages = (await loader.load()) as PDFPage[];
     console.log();
+
+    //2. split the pdf into pages
+    const documents = await Promise.all(pages.map(prepareDocuments));
+    
+    //3. vectorise and embed the individual documents
+    // async function embedDo
+    const vectors  = await Promise.all(documents.flat().map(embedDocument));
+
+    //4. upload to pinecone
+    const client = await getPineconeClient();
+    const pineooneIndex = await client.Index('chatpdf');
+
+    console.log('inserting vectors into pinecone...');
+    const namespace = convertToAscii(fileKey)
     return pages;
+}
+
+async function embedDocument(doc:Document) {
+    try {
+        const embeddings = await getEmbeddings(doc.pageContent);
+        
+        const hash = md5(doc.pageContent);
+
+        return {
+            id:hash,
+            values:embeddings,
+            metadata: {//access the metadata
+                text:doc.metadata.text, //truncate the text
+                pageNumber:doc.metadata.pageNumber,
+            }
+        } as Vector
+    } catch (error) {
+        console.log('error embedding document',error);
+        throw error;
+    }
+}
+
+export const truncateStringByBytes = (str:string,bytes:number) => {
+    const enc = new TextEncoder();
+    return new TextDecoder().decode(enc.encode(str).slice(0,bytes)); //slice the string by bytes
+}
+
+async function prepareDocuments(page:PDFPage) {
+    //3. prepare the documents to be inserted into pinecone
+    let {pageContent,metadata} = page;
+    pageContent = pageContent.replace(/\n/g,' ');
+    // split the docs
+    const splitter = new RecursiveCharacterTextSplitter();
+    const docs = await splitter.splitDocuments([
+        new Document({
+            pageContent,
+            metadata:{
+                pageNumber:metadata.loc.pageNumber,
+                text: truncateStringByBytes(pageContent,36000),
+            }
+        })
+    ]);
+    return docs;
 }
